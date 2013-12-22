@@ -8,9 +8,9 @@ namespace ChatSharp.Events
 {
     public class SocketErrorEventArgs : EventArgs
     {
-        public SocketError SocketError { get; set; }
+        public Exception SocketError { get; set; }
 
-        public SocketErrorEventArgs(SocketError socketError)
+        public SocketErrorEventArgs(Exception socketError)
         {
             SocketError = socketError;
         }

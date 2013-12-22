@@ -5,6 +5,11 @@ using System.Net.Sockets;
 using ChatSharp.Events;
 using System.Timers;
 using ChatSharp.Handlers;
+using System.IO;
+using System.Net.Security;
+using System.Security.Authentication;
+using System.Threading;
+using Timer = System.Timers.Timer;
 
 namespace ChatSharp
 {
@@ -59,18 +64,23 @@ namespace ChatSharp
         }
 
         public Socket Socket { get; set; }
+        public Stream DataStream { get; set; }
         public Encoding Encoding { get; set; }
         public IrcUser User { get; set; }
         public ChannelCollection Channels { get; private set; }
         public ClientSettings Settings { get; set; }
         public RequestManager RequestManager { get; set; }
         public ServerInfo ServerInfo { get; set; }
+        public bool UseSSL { get; set; }
+        private RemoteCertificateValidationCallback UserCertificateValidationCallback { get; set; }
 
-        public IrcClient(string serverAddress, IrcUser user)
+        public IrcClient(string serverAddress, IrcUser user, bool useSsl = false, RemoteCertificateValidationCallback userCertificateValidationCallback = null)
         {
             if (serverAddress == null) throw new ArgumentNullException("serverAddress");
             if (user == null) throw new ArgumentNullException("user");
 
+            UseSSL = useSsl;
+            UserCertificateValidationCallback = userCertificateValidationCallback;
             User = user;
             ServerAddress = serverAddress;
             Encoding = Encoding.UTF8;
@@ -114,7 +124,23 @@ namespace ChatSharp
         private void ConnectComplete(IAsyncResult result)
         {
             Socket.EndConnect(result);
-            Socket.BeginReceive(ReadBuffer, ReadBufferIndex, ReadBuffer.Length, SocketFlags.None, DataRecieved, null);
+            DataStream = new NetworkStream(Socket);
+
+            if (UseSSL)
+            {
+                SslStream sslStream;
+                DataStream = sslStream = new SslStream(DataStream, false, UserCertificateValidationCallback);
+                try
+                {
+                    sslStream.AuthenticateAsClient(ServerHostname);
+                }
+                catch (AuthenticationException ex)
+                {
+                    OnSslError(new SslErrorEventArgs(ex));
+                }
+            }
+
+            DataStream.BeginRead(ReadBuffer, ReadBufferIndex, ReadBuffer.Length, DataRecieved, null);
             // Write login info
             if (!string.IsNullOrEmpty(User.Password))
                 SendRawMessage("PASS {0}", User.Password);
@@ -126,11 +152,15 @@ namespace ChatSharp
 
         private void DataRecieved(IAsyncResult result)
         {
-            SocketError error;
-            int length = Socket.EndReceive(result, out error) + ReadBufferIndex;
-            if (error != SocketError.Success)
+            int length = 0;
+
+            try
             {
-                OnNetworkError(new SocketErrorEventArgs(error));
+                length = DataStream.EndRead(result) + ReadBufferIndex;
+            }
+            catch (Exception ex)
+            {
+                OnNetworkError(new SocketErrorEventArgs(ex));
                 return;
             }
             ReadBufferIndex = 0;
@@ -148,7 +178,7 @@ namespace ChatSharp
                 Array.Copy(ReadBuffer, messageLength, ReadBuffer, 0, length - messageLength);
                 length -= messageLength;
             }
-            Socket.BeginReceive(ReadBuffer, ReadBufferIndex, ReadBuffer.Length - ReadBufferIndex, SocketFlags.None, DataRecieved, null);
+            DataStream.BeginRead(ReadBuffer, ReadBufferIndex, ReadBuffer.Length - ReadBufferIndex, DataRecieved, null);
         }
 
         private void HandleMessage(string rawMessage)
@@ -162,12 +192,14 @@ namespace ChatSharp
                 // TODO: Fire an event or something
             }
         }
-
+        AutoResetEvent _writeLock = new AutoResetEvent(true);
         public void SendRawMessage(string message, params object[] format)
         {
+            _writeLock.WaitOne();
             message = string.Format(message, format);
             var data = Encoding.GetBytes(message + "\r\n");
-            Socket.BeginSend(data, 0, data.Length, SocketFlags.None, MessageSent, message);
+            DataStream.BeginWrite(data, 0, data.Length, MessageSent, message);
+            DataStream.Flush();
         }
 
         public void SendIrcMessage(IrcMessage message)
@@ -177,18 +209,28 @@ namespace ChatSharp
 
         private void MessageSent(IAsyncResult result)
         {
-            SocketError error;
-            Socket.EndSend(result, out error);
-            if (error != SocketError.Success)
-                OnNetworkError(new SocketErrorEventArgs(error));
-            else
-                OnRawMessageSent(new RawMessageEventArgs((string)result.AsyncState, true));
+            try
+            {
+                DataStream.EndWrite(result);
+            }
+            catch (Exception ex)
+            {
+                OnNetworkError(new SocketErrorEventArgs(ex));
+                return;
+            }
+            _writeLock.Set();
+            OnRawMessageSent(new RawMessageEventArgs((string)result.AsyncState, true));
         }
 
         public event EventHandler<SocketErrorEventArgs> NetworkError;
         protected internal virtual void OnNetworkError(SocketErrorEventArgs e)
         {
             if (NetworkError != null) NetworkError(this, e);
+        }
+        public event EventHandler<SslErrorEventArgs> SslError;
+        protected internal virtual void OnSslError(SslErrorEventArgs e)
+        {
+            if (SslError != null) SslError(this, e);
         }
         public event EventHandler<RawMessageEventArgs> RawMessageSent;
         protected internal virtual void OnRawMessageSent(RawMessageEventArgs e)
